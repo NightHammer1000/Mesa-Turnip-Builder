@@ -1,3 +1,29 @@
+**Sep 20, 2026**: Android 13 support + runtime driver switching
+
+**Magisk, KernelSU, and APatch supported**
+
+**Requires Android 13 (SDK 33) to install**
+
+1. Lowered the build target to platform SDK 33, so the module installs and runs
+   on Android 13 devices (Retroid Pocket 5 and friends). The same binary still
+   runs on Android 14/15/16.
+2. The driver is now installed as `vulkan.turnip.so` **alongside** the stock
+   `vulkan.adreno.so` instead of replacing it.
+3. Added runtime driver switching via the module action button - toggles
+   `ro.hardware.vulkan` between `turnip` and the stock driver. No reboot, no
+   reflash; takes effect for newly launched apps.
+4. The selected driver is persisted and re-applied on every boot
+   (`post-fs-data.sh`), and preserved across module updates.
+5. The stock driver name is auto-detected at install time by walking the Vulkan
+   loader's fallback chain, so switching back works on devices that don't set
+   `ro.hardware.vulkan`.
+6. Added `system.prop` with `debug.hwui.renderer=skiagl` to keep the system UI
+   off Turnip.
+7. Build now fails early with a clear message if the NDK has dropped the target
+   API level.
+
+---
+
 **Sep 19, 2026**: Updated Mesa to v26.2.3
 
 **Magisk, KernelSU, and APatch supported**

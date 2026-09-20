@@ -8,21 +8,31 @@ nocolor='\033[0m'
 # Define Android NDK version and download URL
 ndkdir="android-ndk-r30"
 ndkver="https://dl.google.com/android/repository/${ndkdir}-linux.zip"
-sdkver="34"
+
+# Target platform SDK level.
+# 33 = Android 13. Built against 33 the driver still runs on 14/15/16, so this
+# is the widest-compatibility target. Do not raise it without dropping A13.
+sdkver="33"
 
 # Define Mesa version and download URL
-mesadir="mesa-mesa-26.2.3"
-mesaver="https://gitlab.freedesktop.org/mesa/mesa/-/archive/mesa-26.2.3/mesa-mesa-26.2.3.zip?ref_type=tags"
+mesa_version="26.2.3"
+mesadir="mesa-mesa-${mesa_version}"
+mesaver="https://gitlab.freedesktop.org/mesa/mesa/-/archive/mesa-${mesa_version}/mesa-mesa-${mesa_version}.zip?ref_type=tags"
+
+# Module identity
+modid="turnip-mesa"
+modversioncode="20260920"
+updatejson="https://raw.githubusercontent.com/NightHammer1000/Mesa-Turnip-Builder/refs/heads/stable/update.json"
 
 # Define working directories
 workdir="$(pwd)/turnip_workdir"         # Base directory for all operations
 magiskdir="$workdir/turnip_module"      # Directory to create the Magisk module
 
-DRIVER_FILE="vulkan.turnip.so"          # Output Vulkan Driver (emulator)
+DRIVER_FILE="vulkan.turnip.so"          # Output Vulkan Driver (module + emulator)
 META_FILE="meta.json"                   # Metadata
 
-ZIP_FILE_MAGISK="Turnip-26.2.3-MAGISK-KSU.zip"
-ZIP_FILE_EMULATOR="Turnip-26.2.3-EMULATOR.zip" 
+ZIP_FILE_MAGISK="Turnip-${mesa_version}-MAGISK-KSU.zip"
+ZIP_FILE_EMULATOR="Turnip-${mesa_version}-EMULATOR.zip"
 
 # List of required packages to build the Turnip driver
 deps="meson ninja patchelf unzip curl flex bison zip clang ccache pkg-config"
@@ -30,7 +40,7 @@ deps="meson ninja patchelf unzip curl flex bison zip clang ccache pkg-config"
 
 echo "Checking system for required dependencies..."
 
-# Check for required dependencies 
+# Check for required dependencies
 for deps_chk in $deps; do
 
     [ -t 1 ] && sleep 0.25 || true
@@ -94,6 +104,17 @@ cd $mesadir
 # Set NDK Clang bin directory
 ndk_bin="$workdir/$ndkdir/toolchains/llvm/prebuilt/linux-x86_64/bin"
 
+# Make sure this NDK still ships a wrapper for the target API level. NDKs drop
+# support for old API levels over time; fail here with a clear message instead
+# of somewhere deep inside meson.
+if [ ! -x "$ndk_bin/aarch64-linux-android$sdkver-clang" ]; then
+    echo -e "$red $ndkdir does not provide aarch64-linux-android$sdkver-clang. $nocolor"
+    echo -e "$red This NDK no longer supports API $sdkver - pin an older NDK or raise \$sdkver. $nocolor"
+    echo "API levels available in this NDK:"
+    ls "$ndk_bin" | grep -o 'aarch64-linux-android[0-9]*-clang$' | sort -u
+    exit 1
+fi
+
 # Set toolchain variables
 export CC=clang
 export CXX=clang++
@@ -148,7 +169,7 @@ cpu = 'x86_64'
 endian = 'little'
 EOF
 
-echo "Generating build files..." $'\n'
+echo "Generating build files (target API $sdkver)..." $'\n'
 if ! CC=clang CXX=clang++ meson setup build-android-aarch64 \
     --cross-file "$workdir/$mesadir/android-aarch64.txt" \
     --native-file "$workdir/$mesadir/native.txt" \
@@ -156,6 +177,7 @@ if ! CC=clang CXX=clang++ meson setup build-android-aarch64 \
     -Dplatforms=android \
     -Dplatform-sdk-version="$sdkver" \
     -Dandroid-stub=true \
+    -Dandroid-libbacktrace=disabled \
     -Dgallium-drivers= \
     -Dvulkan-drivers=freedreno \
     -Dfreedreno-kmds=kgsl \
@@ -186,18 +208,18 @@ cd "$workdir"
 # Strip unneeded debug symbols to reduce size from ~60MB+ to ~15-20MB
 "$ndk_bin/llvm-strip" --strip-unneeded libvulkan_freedreno.so
 
-# Prepare driver files for Magisk and Emulator
-cp libvulkan_freedreno.so vulkan.adreno.so
+# One driver file for both the root module and the emulator package. It is
+# installed *alongside* the stock vulkan.adreno.so (never over it), so the
+# stock driver stays available for runtime switching.
 cp libvulkan_freedreno.so "$DRIVER_FILE"
 
-# Set DT_SONAME using patchelf to match driver filenames
-patchelf --set-soname vulkan.adreno.so vulkan.adreno.so
+# Set DT_SONAME using patchelf to match the driver filename
 patchelf --set-soname "$DRIVER_FILE" "$DRIVER_FILE"
 
 echo "Prepare magisk module structure..." $'\n'
 p1="system/vendor/lib64/hw"
 mkdir -p "$magiskdir/$p1"
-cp "$workdir/vulkan.adreno.so" "$magiskdir/$p1/"
+cp "$workdir/$DRIVER_FILE" "$magiskdir/$p1/"
 cd "$magiskdir"
 
 meta="META-INF/com/google/android"
@@ -253,6 +275,140 @@ cat <<'EOF' >"$meta/updater-script"
 #MAGISK
 EOF
 
+###############################################################################
+# common.sh - shared helpers for customize.sh / post-fs-data.sh / action.sh
+#
+# Android's Vulkan loader resolves the driver by reading, in order:
+#   ro.hardware.vulkan, ro.hardware, ro.product.board, ro.board.platform, ro.arch
+# and dlopen()ing /vendor/lib64/hw/vulkan.<value>.so
+#
+# So shipping the driver as vulkan.turnip.so and flipping ro.hardware.vulkan
+# switches drivers at runtime without ever touching vulkan.adreno.so.
+###############################################################################
+cat <<'EOF' >"common.sh"
+#!/system/bin/sh
+
+HWDIRS="/vendor/lib64/hw /system/vendor/lib64/hw"
+
+# resetprop lives in a different place on each root solution
+rp() {
+    if command -v resetprop >/dev/null 2>&1; then
+        resetprop "$@"
+    elif [ -x /data/adb/magisk/resetprop ]; then
+        /data/adb/magisk/resetprop "$@"
+    elif [ -x /data/adb/magisk/magisk ]; then
+        /data/adb/magisk/magisk resetprop "$@"
+    elif [ -x /data/adb/ksu/bin/resetprop ]; then
+        /data/adb/ksu/bin/resetprop "$@"
+    elif [ -x /data/adb/ap/bin/resetprop ]; then
+        /data/adb/ap/bin/resetprop "$@"
+    else
+        return 1
+    fi
+}
+
+# hal_lib_exists <name>  ->  true if vulkan.<name>.so is present on the device
+hal_lib_exists() {
+    [ -n "$1" ] || return 1
+    for d in $HWDIRS; do
+        [ -f "$d/vulkan.$1.so" ] && return 0
+    done
+    return 1
+}
+
+# apply_vulkan_hal <name>
+# An empty name deletes the property, which makes the loader fall back to
+# ro.hardware / ro.board.platform exactly as it did before this module existed.
+apply_vulkan_hal() {
+    if [ -z "$1" ]; then
+        rp --delete ro.hardware.vulkan
+    else
+        rp ro.hardware.vulkan "$1"
+    fi
+}
+
+# Walk the loader's fallback chain looking for a driver that actually exists,
+# so we know what to switch back to. Never returns "turnip".
+detect_stock_hal() {
+    for cand in "$(getprop ro.hardware.vulkan)" adreno \
+                "$(getprop ro.hardware)" \
+                "$(getprop ro.product.board)" \
+                "$(getprop ro.board.platform)"; do
+        [ -z "$cand" ] && continue
+        [ "$cand" = "turnip" ] && continue
+        if hal_lib_exists "$cand"; then
+            echo "$cand"
+            return 0
+        fi
+    done
+    echo ""
+}
+EOF
+
+###############################################################################
+# post-fs-data.sh - re-applies the persisted driver choice on every boot
+###############################################################################
+cat <<EOF >"post-fs-data.sh"
+#!/system/bin/sh
+MODDIR=\${0%/*}
+[ -d "\$MODDIR" ] || MODDIR=/data/adb/modules/$modid
+. "\$MODDIR/common.sh"
+
+MODE=turnip
+[ -f "\$MODDIR/driver_mode" ] && MODE=\$(cat "\$MODDIR/driver_mode")
+
+if [ "\$MODE" = "stock" ]; then
+    STOCK=""
+    [ -f "\$MODDIR/stock_vulkan_hal" ] && STOCK=\$(cat "\$MODDIR/stock_vulkan_hal")
+    apply_vulkan_hal "\$STOCK"
+else
+    apply_vulkan_hal turnip
+fi
+EOF
+
+###############################################################################
+# action.sh - Magisk / KernelSU / APatch action button: toggle the driver
+###############################################################################
+cat <<EOF >"action.sh"
+#!/system/bin/sh
+MODDIR=\${0%/*}
+[ -d "\$MODDIR" ] || MODDIR=/data/adb/modules/$modid
+. "\$MODDIR/common.sh"
+
+STOCK=""
+[ -f "\$MODDIR/stock_vulkan_hal" ] && STOCK=\$(cat "\$MODDIR/stock_vulkan_hal")
+
+CURRENT=\$(getprop ro.hardware.vulkan)
+
+if [ "\$CURRENT" = "turnip" ]; then
+    if apply_vulkan_hal "\$STOCK"; then
+        echo stock > "\$MODDIR/driver_mode"
+        if [ -n "\$STOCK" ]; then
+            echo "Switched to: stock driver (vulkan.\$STOCK.so)"
+        else
+            echo "Switched to: stock driver (ro.hardware.vulkan cleared)"
+        fi
+    else
+        echo "ERROR: resetprop not available - cannot switch."
+    fi
+else
+    if apply_vulkan_hal turnip; then
+        echo turnip > "\$MODDIR/driver_mode"
+        echo "Switched to: Turnip (Mesa $mesa_version)"
+    else
+        echo "ERROR: resetprop not available - cannot switch."
+    fi
+fi
+
+echo ""
+echo "ro.hardware.vulkan = \$(getprop ro.hardware.vulkan)"
+echo ""
+echo "Takes effect for newly launched apps."
+echo "Already-running apps keep the old driver until restarted."
+echo "The choice is remembered across reboots."
+sleep 5
+EOF
+
 cat <<'EOF' >"uninstall.sh"
 #!/system/bin/sh
 find /data/user/*/*/*cache /data/data/*/*cache /data/user_de/*/*/*cache -mindepth 1 -maxdepth 3 \
@@ -260,25 +416,36 @@ find /data/user/*/*/*cache /data/data/*/*cache /data/user_de/*/*/*cache -mindept
     -exec rm -rf {} + 2>/dev/null || true
 EOF
 
-cat <<EOF >"module.prop"
-id=turnip-mesa
-name=Freedreno Turnip Vulkan Driver STABLE
-version=v26.2.3
-versionCode=20260919
-author=V3KT0R-87
-description=Turnip is an open-source vulkan driver for devices with Adreno 6xx-8xx GPUs.
-updateJson=https://raw.githubusercontent.com/v3kt0r-87/Mesa-Turnip-Builder/refs/heads/stable/update.json
+# Keep the UI renderer on GL. Turnip is meant for apps/games here; letting
+# HWUI (SystemUI, launcher) run on it is the usual cause of boot loops.
+cat <<'EOF' >"system.prop"
+debug.hwui.renderer=skiagl
 EOF
 
-cat <<'EOF' >"customize.sh"
-MODVER=`grep_prop version $MODPATH/module.prop`
-MODVERCODE=`grep_prop versionCode $MODPATH/module.prop`
+cat <<EOF >"module.prop"
+id=$modid
+name=Freedreno Turnip Vulkan Driver STABLE
+version=v$mesa_version (SDK $sdkver)
+versionCode=$modversioncode
+author=V3KT0R-87, N1GHT
+description=Turnip open-source Vulkan driver for Adreno 6xx-8xx GPUs. Installed alongside the stock driver - tap the action button to switch between Turnip and stock.
+updateJson=$updatejson
+EOF
+
+cat <<EOF >"customize.sh"
+. \$MODPATH/common.sh
+
+OLDDIR=/data/adb/modules/$modid
+
+MODVER=\$(grep_prop version \$MODPATH/module.prop)
+MODVERCODE=\$(grep_prop versionCode \$MODPATH/module.prop)
 
 ui_print ""
-ui_print "Version=$MODVER "
-ui_print "MagiskVersion=$MAGISK_VER"
+ui_print "Version=\$MODVER "
+ui_print "MagiskVersion=\$MAGISK_VER"
 ui_print ""
 ui_print "Freedreno Turnip Vulkan Driver -V3KT0R"
+ui_print "Runtime driver switching -N1GHT"
 ui_print "Adreno Driver Support Group - Telegram"
 ui_print ""
 sleep 1.25
@@ -287,9 +454,39 @@ ui_print ""
 ui_print "Checking Device info ..."
 sleep 1.25
 
-SDK_VER=$(getprop ro.build.version.sdk)
-[ -z "$SDK_VER" ] && SDK_VER=$(getprop ro.system.build.version.sdk)
-[ "${SDK_VER:-0}" -lt 34 ] && abort "Android 14 is now required! Aborting ..."
+SDK_VER=\$(getprop ro.build.version.sdk)
+[ -z "\$SDK_VER" ] && SDK_VER=\$(getprop ro.system.build.version.sdk)
+[ "\${SDK_VER:-0}" -lt $sdkver ] && abort "Android 13 (SDK $sdkver) or newer is required! Aborting ..."
+
+ui_print "- Android SDK \$SDK_VER"
+ui_print "- Board: \$(getprop ro.board.platform)"
+
+# Work out what the stock driver is, so the action button can switch back to
+# it. On a reinstall ro.hardware.vulkan already reads "turnip", so reuse the
+# value saved by the previous install before probing.
+STOCK=""
+if [ -f "\$OLDDIR/stock_vulkan_hal" ]; then
+    STOCK=\$(cat "\$OLDDIR/stock_vulkan_hal")
+else
+    STOCK=\$(detect_stock_hal)
+fi
+echo "\$STOCK" > \$MODPATH/stock_vulkan_hal
+
+if [ -n "\$STOCK" ]; then
+    ui_print "- Stock Vulkan driver: vulkan.\$STOCK.so"
+else
+    ui_print "- Stock Vulkan driver: not detected"
+    ui_print "  (switching back clears ro.hardware.vulkan)"
+fi
+
+# Preserve the user's driver choice across module updates
+if [ -f "\$OLDDIR/driver_mode" ]; then
+    cp "\$OLDDIR/driver_mode" \$MODPATH/driver_mode
+    ui_print "- Keeping driver selection: \$(cat \$MODPATH/driver_mode)"
+else
+    echo turnip > \$MODPATH/driver_mode
+fi
+
 ui_print ""
 ui_print "Everything looks fine .... proceeding"
 ui_print ""
@@ -297,13 +494,17 @@ ui_print "Installing Driver Please Wait ..."
 ui_print ""
 
 sleep 1.25
-set_perm_recursive $MODPATH/system 0 0 0755 0644
-set_perm $MODPATH/system/vendor/lib64/hw/vulkan.adreno.so 0 0 0644 u:object_r:same_process_hal_file:s0
+set_perm_recursive \$MODPATH/system 0 0 0755 0644
+set_perm \$MODPATH/system/vendor/lib64/hw/$DRIVER_FILE 0 0 0644 u:object_r:same_process_hal_file:s0
+set_perm \$MODPATH/common.sh 0 0 0644
+set_perm \$MODPATH/post-fs-data.sh 0 0 0755
+set_perm \$MODPATH/action.sh 0 0 0755
+set_perm \$MODPATH/uninstall.sh 0 0 0755
 
 ui_print ""
 ui_print " Cleaning GPU Cache ... Please wait!"
-find /data/user/*/*/*cache /data/data/*/*cache /data/user_de/*/*/*cache -mindepth 1 -maxdepth 3 \
-    \( -iname "*shader*" -o -iname "*graphitecache*" -o -iname "*gpucache*" \) \
+find /data/user/*/*/*cache /data/data/*/*cache /data/user_de/*/*/*cache -mindepth 1 -maxdepth 3 \\
+    \\( -iname "*shader*" -o -iname "*graphitecache*" -o -iname "*gpucache*" \\) \\
     -exec rm -rf {} + 2>/dev/null || true
 
 ui_print ""
@@ -314,9 +515,13 @@ ui_print "Driver installed Successfully"
 sleep 1.25
 
 ui_print ""
-ui_print "All done, Please REBOOT device"
+ui_print "The stock driver was NOT replaced."
+ui_print "Tap the module's action button to switch:"
+ui_print "  Turnip  <->  stock Adreno"
 ui_print ""
-ui_print "BY: @VEKT0R_87"
+ui_print "REBOOT is required before first use."
+ui_print ""
+ui_print "BY: @VEKT0R_87 / @N1GHT"
 ui_print ""
 EOF
 
@@ -325,6 +530,9 @@ echo "Packing driver files into Magisk/KSU module ..." $'\n'
 chmod 0755 "$meta/update-binary"
 chmod 0755 customize.sh
 chmod 0755 uninstall.sh
+chmod 0755 action.sh
+chmod 0755 post-fs-data.sh
+chmod 0644 common.sh
 
 zip -r "$workdir/$ZIP_FILE_MAGISK" * &> /dev/null
 
@@ -344,14 +552,14 @@ else
  cat <<EOF > "$META_FILE"
 {
   "schemaVersion": 1,
-  "name": "Freedreno Turnip Driver 26.2.3",
-  "description": "Compiled using Android NDK 30",
+  "name": "Freedreno Turnip Driver $mesa_version",
+  "description": "Compiled using Android NDK 30 (API $sdkver)",
   "author": "v3kt0r-87",
   "packageVersion": "3",
   "vendor": "Mesa3D",
   "driverVersion": "Vulkan 1.3/4",
-  "minApi": 34,
-  "libraryName": "vulkan.turnip.so"
+  "minApi": $sdkver,
+  "libraryName": "$DRIVER_FILE"
 }
 EOF
 
@@ -365,11 +573,11 @@ EOF
 
     echo -e "$green Build Finished :). $nocolor" $'\n'
     echo -e "$green-All done, you can take your drivers from here:$nocolor" $'\n'
-    echo -e "Magisk-KSU Module : $workdir/$ZIP_FILE_MAGISK" $'\n' 
+    echo -e "Magisk-KSU Module : $workdir/$ZIP_FILE_MAGISK" $'\n'
     echo -e "Emulator : $workdir/$ZIP_FILE_EMULATOR" $'\n'
     echo -e "Turnip Driver : $workdir/$DRIVER_FILE" $'\n'
 
-    # Cleanup 
+    # Cleanup
     rm -f "$META_FILE"
 
     # Clean up fake-cc directory and symbolic links on exit

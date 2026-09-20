@@ -49,8 +49,10 @@ jobs:
       - name: Extract Mesa Version
         id: get_version
         run: |
-          VERSION=$(grep '^mesadir=' build-turnip.sh | cut -d'"' -f2 | sed 's/mesa-mesa-//')
+          VERSION=$(grep '^mesa_version=' build-turnip.sh | cut -d'"' -f2)
+          SDK=$(grep '^sdkver=' build-turnip.sh | cut -d'"' -f2)
           echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "sdk=$SDK" >> $GITHUB_OUTPUT
 
       - name: Run Turnip Build Script
         run: |
@@ -75,8 +77,8 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           name: MESA-Turnip-${{ steps.get_version.outputs.version }}
           body: |
-            ## KernelSU and Magisk supported
-            ## Android 14 and above required to install
+            ## KernelSU, Magisk and APatch supported
+            ## Android 13 (SDK ${{ steps.get_version.outputs.sdk }}) and above required to install
 
             * ✅ **Turnip (Vulkan driver)** upgraded to **Mesa ${{ steps.get_version.outputs.version }}**, synced with latest upstream changes.
             * ⚡ Continued **performance improvements** and **bug fixes** for various Vulkan games and applications.
@@ -84,12 +86,14 @@ jobs:
             * 🧩 Additional tuning for Android-specific driver quirks and rendering edge cases.
             * 🚀 Optimized **GPU Cache Cleaner** into single-pass targeted traversal (prevents installer freezes).
             * 🛡️ Fixed SELinux context for vendor HAL (`same_process_hal_file`).
+            * 📱 **Android 13 support** - built against platform SDK ${{ steps.get_version.outputs.sdk }} (still runs on 14/15/16).
+            * 🔁 **Runtime driver switching** - installs as `vulkan.turnip.so` beside the stock driver; tap the module's action button to switch Turnip ↔ stock without reflashing. The choice survives reboots.
 
             ---
 
             ## 🛠️ Build Info
             * 🧼 All binaries **stripped using `llvm-strip`** to reduce size and remove debug info.
-            * ⚙️ Compiled using **Android NDK r30**.
+            * ⚙️ Compiled using **Android NDK r30**, target API **${{ steps.get_version.outputs.sdk }}**.
 
             ---
 
